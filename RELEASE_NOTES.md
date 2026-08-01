@@ -1,3 +1,33 @@
+# 1GenPokemonVR v0.2.0 — Quest 3 standalone preview
+
+## New
+
+- Standalone, ROM-free Meta Quest 3/3S APK (`arm64-v8a`).
+- Native Android OpenXR/OpenGL ES bridge using the official Khronos loader.
+- **VR OPTION -> ENVIRONMENT -> AR PASSTHROUGH** places the voxel world over
+  the real room through Meta color passthrough.
+- The first-run ROM chooser is presented as a spatial OpenXR panel and accepts
+  the right Touch controller ray.
+- The same spatial battles, VR menu pointer, camera modes and world placement
+  controls from the Windows build are included.
+
+## Preview status
+
+The APK builds, signs and passes structural validation. It includes the
+immersive HMD manifest category, Quest 3/3S metadata, ARM64 LÖVE runtime,
+`libgen1openxr.so`, `libopenxr_loader.so` and a ROM-free `game.love` payload.
+A physical-headset comfort/performance pass is still required before calling
+this a stable Quest release.
+
+## Install
+
+1. Enable Developer Mode on the Quest.
+2. Install the APK with Meta Quest Developer Hub or `adb install -r`.
+3. Open **Library -> Unknown Sources -> 1GenPokemonVR Quest**.
+4. Select a legally obtained compatible US Pokémon Red or Blue ROM.
+
+---
+
 # 1GenPokemonVR v0.1.0
 
 This is the first OpenXR preview distribution candidate of 1GenPokemonVR.
