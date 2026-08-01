@@ -1,9 +1,10 @@
 # 1GenPokemonVR
 
-**1GenPokemonVR** is an experimental Windows OpenXR edition of the Generation
-1 recompilation. It combines the native game engine, a voxel overworld and a
-custom stereo bridge. The overworld renders as real per-eye 3D geometry, while
-menus and spatial battles use stable OpenXR composition layers.
+**1GenPokemonVR** is an experimental OpenXR edition of the Generation 1
+recompilation for Windows PC VR and standalone Meta Quest 3/3S. It combines
+the native game engine, a voxel overworld and a custom stereo bridge. The
+overworld renders as real per-eye 3D geometry, while menus and spatial battles
+use stable OpenXR composition layers.
 
 This repository does not contain a Pokemon ROM or extracted copyrighted game
 assets. Players must provide a legally obtained compatible US Pokemon Red or
@@ -12,6 +13,8 @@ Blue ROM during the first launch.
 ## VR highlights
 
 - Native stereo OpenXR rendering with 6DoF head tracking.
+- Standalone Quest 3/3S APK with no PC or Link connection required.
+- Optional color-passthrough AR environment using `XR_FB_passthrough`.
 - Meta Touch, Valve Index, HTC Vive and Windows Mixed Reality bindings.
 - Ray pointer and draggable browser-style scrollbars in menus.
 - Immersive, orbit, overhead and first-person cameras.
@@ -114,6 +117,18 @@ later launches start directly. Press `F8` to recenter.
 See [`docs/vr.md`](docs/vr.md) for prerequisites, build details, controls and
 the renderer architecture.
 
+## Standalone Quest 3 / 3S preview
+
+Install the Quest APK with Meta Quest Developer Hub or `adb install -r`, then
+launch **1GenPokemonVR Quest** from Unknown Sources. The first-run ROM chooser
+is a spatial panel controlled with the right Touch controller ray.
+
+The default presentation is immersive VR. To place the voxel world over the
+real room, open **START -> VR OPTION** and set **ENVIRONMENT** to
+**AR PASSTHROUGH**. Camera position, world scale, view distance, height and
+offset remain adjustable in the same menu. See [`docs/quest.md`](docs/quest.md)
+for installation and build details.
+
 ## Portable Mode
 
 By default the game keeps your save, options, and the private ROM-derived
@@ -147,7 +162,7 @@ reference — lives on the
 
 Shipped example mods, one per kind of author, live in [`mods/`](mods/).
 
-
+## More
 
 - [Link play](https://github.com/bryanthaboi/pokemon-gen1-recomp-project/wiki/Guide-Link-Play)
   — START > LINK connects two copies directly over UDP.
