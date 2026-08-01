@@ -21,7 +21,3 @@ its copyright holder.
 
 The game engine is derived from:
 https://github.com/bryanthaboi/gen1recomp
-
-At the time this distribution was prepared, that repository also did not
-provide a root LICENSE file. Confirm redistribution permission with its
-copyright holders before publishing source or binary releases.
