@@ -14,7 +14,6 @@ Blue ROM during the first launch.
 
 - Native stereo OpenXR rendering with 6DoF head tracking.
 - Standalone Quest 3/3S APK with no PC or Link connection required.
-- Optional color-passthrough AR environment using `XR_FB_passthrough`.
 - Meta Touch, Valve Index, HTC Vive and Windows Mixed Reality bindings.
 - Ray pointer and draggable browser-style scrollbars in menus.
 - Immersive, orbit, overhead and first-person cameras.
@@ -123,11 +122,10 @@ Install the Quest APK with Meta Quest Developer Hub or `adb install -r`, then
 launch **1GenPokemonVR Quest** from Unknown Sources. The first-run ROM chooser
 is a spatial panel controlled with the right Touch controller ray.
 
-The default presentation is immersive VR. To place the voxel world over the
-real room, open **START -> VR OPTION** and set **ENVIRONMENT** to
-**AR PASSTHROUGH**. Camera position, world scale, view distance, height and
-offset remain adjustable in the same menu. See [`docs/quest.md`](docs/quest.md)
-for installation and build details.
+The standalone build uses an opaque immersive VR environment. Camera position,
+world scale, view distance, height and offset remain adjustable under
+**START -> VR OPTION**. See [`docs/quest.md`](docs/quest.md) for installation
+and build details.
 
 ## Portable Mode
 
