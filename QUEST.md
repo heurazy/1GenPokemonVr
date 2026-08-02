@@ -7,10 +7,10 @@ SteamVR or a PC OpenXR runtime while playing.
 
 1. Enable Developer Mode for the headset.
 2. Connect it by USB and accept the debugging prompt.
-3. Install `1GenPokemonVR-Quest3-v0.2.0.apk` with Meta Quest Developer Hub, or:
+3. Install `1GenPokemonVR-Quest3-v0.2.11.apk` with Meta Quest Developer Hub, or:
 
    ```sh
-   adb install -r 1GenPokemonVR-Quest3-v0.2.0.apk
+   adb install -r 1GenPokemonVR-Quest3-v0.2.11.apk
    ```
 
 4. In the headset, open **Library -> Unknown Sources** and launch
@@ -19,14 +19,9 @@ SteamVR or a PC OpenXR runtime while playing.
    obtained compatible US Pokémon Red or Blue ROM. No ROM is shipped in the
    APK.
 
-## AR mode
+## VR options
 
-Open **START -> VR OPTION**, then change **ENVIRONMENT** from **VR** to
-**AR PASSTHROUGH**. The OpenXR bridge creates a Meta passthrough composition
-layer behind the transparent voxel renderer. Menus, battle HUD, Pokémon and
-important information remain separate foreground layers.
-
-Use the remaining VR options to move and resize the virtual world:
+Open **START -> VR OPTION** to move and resize the virtual world:
 
 - **CAMERA** changes immersive, orbit, overhead or first-person presentation.
 - **WORLD SCALE** changes the apparent size of the voxel world.
@@ -39,7 +34,7 @@ Use the remaining VR options to move and resize the virtual world:
 From PowerShell on Windows:
 
 ```powershell
-.\scripts\build-quest.ps1 -Version 0.2.0 -Configuration Debug
+.\scripts\build-quest.ps1 -Version 0.2.11 -Configuration Debug
 ```
 
 The script packages a ROM-free payload, builds the Android ARM64 OpenXR/GLES
