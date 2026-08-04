@@ -1,0 +1,85 @@
+name: Build MK64 Quest 3 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build-mk64-quest3-apk
+
+permissions:
+  contents: read
+
+env:
+  SPAGHETTIKART_COMMIT: 9253aad869c96a8e660f707a74fe57c5d4ebdd2a
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android components
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Clone SpaghettiKart
+        run: |
+          git clone --recursive https://github.com/izzy2lost/SpaghettiKart.git SpaghettiKart
+          cd SpaghettiKart
+          git checkout "$SPAGHETTIKART_COMMIT"
+          git submodule update --init --recursive
+
+      - name: Restore Quest 3 patch kit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          payload = Path('quest3-kit.b64').read_text().strip()
+          Path('quest3-kit.zip').write_bytes(base64.b64decode(payload))
+          PY
+          unzip -q quest3-kit.zip -d quest3-kit
+
+      - name: Apply Quest 3 native stereo patch
+        run: |
+          python3 quest3-kit/scripts/apply_quest3_vr.py SpaghettiKart
+
+      - name: Configure Android SDK path
+        run: |
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > SpaghettiKart/android/local.properties
+
+      - name: Build debug APK
+        working-directory: SpaghettiKart/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          cp SpaghettiKart/android/app/build/outputs/apk/debug/app-debug.apk output/MarioKart64-Quest3-VR-debug.apk
+          sha256sum output/MarioKart64-Quest3-VR-debug.apk > output/MarioKart64-Quest3-VR-debug.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarioKart64-Quest3-VR-APK
+          path: output/*
+          if-no-files-found: error
