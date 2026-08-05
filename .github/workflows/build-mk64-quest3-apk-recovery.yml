@@ -52,9 +52,10 @@ jobs:
           printf 'y\n' | zip -FF quest3-kit.partial.zip --out quest3-kit.fixed.zip || true
           test -s quest3-kit.fixed.zip
           mkdir -p quest3-kit
-          unzip -o quest3-kit.fixed.zip -d quest3-kit
+          unzip -o quest3-kit.fixed.zip -d quest3-kit || true
           PATCH_SCRIPT="$(find quest3-kit -type f -name apply_quest3_vr.py -print -quit)"
           test -n "$PATCH_SCRIPT"
+          sed -n '1,260p' "$PATCH_SCRIPT"
           python3 -m py_compile "$PATCH_SCRIPT"
           python3 "$PATCH_SCRIPT" SpaghettiKart
           find SpaghettiKart -type f \( -iname '*openxr*' -o -iname '*quest*' -o -iname '*xr*bridge*' \) -print | sort
