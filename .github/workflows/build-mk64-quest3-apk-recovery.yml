@@ -2,6 +2,8 @@ name: Build MK64 Quest 3 APK Recovery
 
 on:
   workflow_dispatch:
+  push:
+    branches: [build-mk64-quest3-apk]
   pull_request:
     branches: [main]
 
