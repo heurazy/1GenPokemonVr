@@ -40,10 +40,10 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-33" \
             "build-tools;33.0.2" \
-            "ndk;25.2.9519653"
+            "ndk;27.0.12077973"
           cat > sm64coopdx/local.properties <<EOF
           sdk.dir=$ANDROID_HOME
-          ndk.dir=$ANDROID_HOME/ndk/25.2.9519653
+          ndk.dir=$ANDROID_HOME/ndk/27.0.12077973
           EOF
           if [ ! -f sm64coopdx/build.gradle ]; then
             cp sm64coopdx/platform/build.gradle sm64coopdx/build.gradle
