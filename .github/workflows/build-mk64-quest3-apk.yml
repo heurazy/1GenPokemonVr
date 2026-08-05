@@ -1,0 +1,269 @@
+name: Build MK64 Quest 3 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build-mk64-quest3-apk
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  SPAGHETTIKART_COMMIT: 9253aad869c96a8e660f707a74fe57c5d4ebdd2a
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android and host build components
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;30.0.15729638" \
+            "cmake;3.30.3"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Clone SpaghettiKart
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --recursive https://github.com/izzy2lost/SpaghettiKart.git SpaghettiKart
+          cd SpaghettiKart
+          git checkout "$SPAGHETTIKART_COMMIT"
+          git submodule update --init --recursive
+
+      - name: Restore Quest 3 patch kit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import io
+          import struct
+          import zlib
+          import zipfile
+          from pathlib import Path
+
+          payload_path = Path("quest3-kit.b64")
+          payload = "".join(payload_path.read_text(encoding="utf-8").split())
+          if not payload:
+              raise SystemExit("quest3-kit.b64 is empty")
+
+          # The original upload may be missing ZIP central-directory bytes. Base64
+          # itself can still be decoded after restoring padding, and all complete
+          # local ZIP entries before the cut can be recovered deterministically.
+          raw = base64.b64decode(payload + "=" * (-len(payload) % 4), validate=False)
+          Path("quest3-kit.partial.zip").write_bytes(raw)
+          destination = Path("quest3-kit")
+          destination.mkdir(parents=True, exist_ok=True)
+
+          def safe_target(name: str) -> Path:
+              target = (destination / name).resolve()
+              root = destination.resolve()
+              if target != root and root not in target.parents:
+                  raise RuntimeError(f"Unsafe ZIP path: {name}")
+              return target
+
+          extracted = 0
+          try:
+              with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                  archive.extractall(destination)
+                  extracted = len(archive.infolist())
+                  print(f"Extracted a complete ZIP ({extracted} entries)")
+          except zipfile.BadZipFile:
+              print("ZIP central directory is incomplete; recovering local entries")
+              position = 0
+              while True:
+                  signature = raw.find(b"PK\x03\x04", position)
+                  if signature < 0 or signature + 30 > len(raw):
+                      break
+
+                  (
+                      _signature,
+                      _version,
+                      flags,
+                      method,
+                      _mtime,
+                      _mdate,
+                      _crc32,
+                      compressed_size,
+                      _uncompressed_size,
+                      filename_length,
+                      extra_length,
+                  ) = struct.unpack_from("<IHHHHHIIIHH", raw, signature)
+
+                  filename_start = signature + 30
+                  data_start = filename_start + filename_length + extra_length
+                  if data_start > len(raw):
+                      break
+
+                  filename = raw[
+                      filename_start : filename_start + filename_length
+                  ].decode("utf-8", errors="replace")
+
+                  if flags & 0x08:
+                      # Data-descriptor mode: for deflate streams, zlib tells us
+                      # exactly where the compressed stream ends.
+                      if method != 8:
+                          print(f"Stopping at unsupported descriptor entry: {filename}")
+                          break
+                      decompressor = zlib.decompressobj(-15)
+                      output = decompressor.decompress(raw[data_start:])
+                      output += decompressor.flush()
+                      if not decompressor.eof:
+                          print(f"Stopping at incomplete entry: {filename}")
+                          break
+                      consumed = len(raw[data_start:]) - len(decompressor.unused_data)
+                      data_end = data_start + consumed
+                  else:
+                      data_end = data_start + compressed_size
+                      if data_end > len(raw):
+                          print(f"Stopping at incomplete entry: {filename}")
+                          break
+                      compressed = raw[data_start:data_end]
+                      if method == 0:
+                          output = compressed
+                      elif method == 8:
+                          output = zlib.decompress(compressed, -15)
+                      else:
+                          print(f"Stopping at unsupported compression method {method}: {filename}")
+                          break
+
+                  target = safe_target(filename)
+                  if filename.endswith("/"):
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(output)
+                  extracted += 1
+                  position = data_end
+
+                  if flags & 0x08:
+                      if raw[position : position + 4] == b"PK\x07\x08":
+                          position += 16
+                      else:
+                          position += 12
+
+              print(f"Recovered {extracted} complete local ZIP entries")
+
+          scripts = list(destination.rglob("apply_quest3_vr.py"))
+          if not scripts:
+              raise SystemExit("apply_quest3_vr.py was not recoverable from the patch kit")
+          if len(scripts) != 1:
+              raise SystemExit(f"Expected one apply script, found {scripts}")
+
+          script = scripts[0]
+          compile(script.read_text(encoding="utf-8"), str(script), "exec")
+          Path("quest3-apply-script.txt").write_text(str(script), encoding="utf-8")
+          print(f"Quest patch script ready: {script}")
+          PY
+
+      - name: Apply Quest 3 native stereo and controls patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PATCH_SCRIPT="$(cat quest3-apply-script.txt)"
+          python3 "$PATCH_SCRIPT" SpaghettiKart
+
+          echo "Quest/OpenXR files added by the patch:"
+          find SpaghettiKart -type f \( \
+            -iname '*quest*' -o \
+            -iname '*openxr*' -o \
+            -iname '*xr*bridge*' \
+          \) -print | sort || true
+
+      - name: Configure Android SDK path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > SpaghettiKart/android/local.properties
+
+      - name: Build mandatory spaghetti.o2r launcher assets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake \
+            -S SpaghettiKart/torch \
+            -B SpaghettiKart/torch/build-host \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_STANDALONE=ON \
+            -DBUILD_MK64=ON \
+            -DBUILD_NAUDIO=ON \
+            -DBUILD_SM64=OFF \
+            -DBUILD_SF64=OFF \
+            -DBUILD_FZERO=OFF \
+            -DBUILD_MARIO_ARTIST=OFF
+          cmake --build SpaghettiKart/torch/build-host --parallel 2
+          SpaghettiKart/torch/build-host/torch pack \
+            SpaghettiKart/assets \
+            SpaghettiKart/spaghetti.o2r \
+            o2r
+          mkdir -p SpaghettiKart/android/app/src/main/assets
+          cp SpaghettiKart/spaghetti.o2r SpaghettiKart/android/app/src/main/assets/spaghetti.o2r
+          test -s SpaghettiKart/android/app/src/main/assets/spaghetti.o2r
+
+      - name: Build debug APK
+        working-directory: SpaghettiKart/android
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Validate and collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          APK="SpaghettiKart/android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          "$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          "$ANDROID_SDK_ROOT/build-tools/36.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
+          unzip -l "$APK" | grep -E 'spaghetti\.o2r|libSpaghettify\.so' | tee apk-required-files.txt
+          grep -q 'spaghetti.o2r' apk-required-files.txt
+          grep -q 'libSpaghettify.so' apk-required-files.txt
+
+          mkdir -p output
+          cp "$APK" output/MarioKart64-Quest3-VR-debug.apk
+          cp apk-badging.txt apk-required-files.txt output/
+          sha256sum output/MarioKart64-Quest3-VR-debug.apk > output/MarioKart64-Quest3-VR-debug.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarioKart64-Quest3-VR-APK
+          path: output/*
+          if-no-files-found: error
+          retention-days: 14
