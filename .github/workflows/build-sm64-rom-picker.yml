@@ -1,0 +1,79 @@
+name: Build SM64 Android ROM Picker APK
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Clone Android port
+        run: git clone --depth 1 --branch android https://github.com/ManIsCat2/sm64coopdx.git sm64coopdx
+
+      - name: Apply ROM picker
+        run: python3 scripts/apply_patch.py sm64coopdx scripts/RomPickerActivity.java
+
+      - name: Prepare generated source aliases
+        shell: bash
+        run: |
+          mkdir -p sm64coopdx/build/us_pc
+          ln -s ../../levels sm64coopdx/build/us_pc/levels
+
+      - name: Install Android components
+        shell: bash
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-33" \
+            "build-tools;33.0.2" \
+            "ndk;27.0.12077973"
+          cat > sm64coopdx/local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          ndk.dir=$ANDROID_HOME/ndk/27.0.12077973
+          EOF
+          if [ ! -f sm64coopdx/build.gradle ]; then
+            cp sm64coopdx/platform/build.gradle sm64coopdx/build.gradle
+          fi
+
+      - name: Build debug APK
+        working-directory: sm64coopdx
+        shell: bash
+        run: gradle :platform:app:assembleDebug --no-daemon --stacktrace
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p out
+          APK=$(find sm64coopdx/platform/app/build/outputs/apk -type f -name '*.apk' | head -n 1)
+          test -n "$APK"
+          cp "$APK" out/SM64-Android-ROM-Picker-debug.apk
+          sha256sum out/SM64-Android-ROM-Picker-debug.apk > out/SHA256SUMS.txt
+          unzip -t out/SM64-Android-ROM-Picker-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SM64-Android-ROM-Picker-APK
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
