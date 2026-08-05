@@ -22,6 +22,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
       - name: Clone Android port
         run: git clone --depth 1 --branch android https://github.com/ManIsCat2/sm64coopdx.git sm64coopdx
 
@@ -40,13 +45,14 @@ jobs:
           sdk.dir=$ANDROID_HOME
           ndk.dir=$ANDROID_HOME/ndk/25.2.9519653
           EOF
+          if [ ! -f sm64coopdx/build.gradle ]; then
+            cp sm64coopdx/platform/build.gradle sm64coopdx/build.gradle
+          fi
 
       - name: Build debug APK
         working-directory: sm64coopdx
         shell: bash
-        run: |
-          chmod +x gradlew || true
-          ./gradlew :platform:app:assembleDebug --no-daemon --stacktrace
+        run: gradle :platform:app:assembleDebug --no-daemon --stacktrace
 
       - name: Stage artifact
         shell: bash
