@@ -33,6 +33,12 @@ jobs:
       - name: Apply ROM picker
         run: python3 scripts/apply_patch.py sm64coopdx scripts/RomPickerActivity.java
 
+      - name: Prepare generated source aliases
+        shell: bash
+        run: |
+          mkdir -p sm64coopdx/build/us_pc
+          ln -s ../../levels sm64coopdx/build/us_pc/levels
+
       - name: Install Android components
         shell: bash
         run: |
