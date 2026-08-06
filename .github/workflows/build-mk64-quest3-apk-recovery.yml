@@ -84,9 +84,23 @@ jobs:
         working-directory: SpaghettiKart/android
         shell: bash
         run: |
-          set -euxo pipefail
+          set -uo pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon :app:assembleDebug --stacktrace
+          ./gradlew --no-daemon :app:assembleDebug --stacktrace --info 2>&1 | tee ../../gradle-build.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-build-failure-logs
+          path: |
+            gradle-build.log
+            SpaghettiKart/android/app/.cxx/**/CMakeFiles/CMakeOutput.log
+            SpaghettiKart/android/app/.cxx/**/CMakeFiles/CMakeError.log
+            SpaghettiKart/android/app/.cxx/**/build.ninja
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Validate APK
         shell: bash
