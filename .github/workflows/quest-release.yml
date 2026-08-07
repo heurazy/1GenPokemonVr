@@ -32,10 +32,9 @@ jobs:
         run: |
           sdkmanager 'platform-tools' 'platforms;android-34' 'build-tools;34.0.0' 'ndk;27.0.12077973'
 
-      - name: Run ROM-free regression tests
-        shell: pwsh
-        run: .\scripts\test-windows.ps1 -Quick
-
+      # The ROM-free source suite runs in ci.yml. The release runner does not
+      # install desktop LÖVE; keeping this job build-only avoids making Quest
+      # publication depend on an unrelated desktop runtime.
       - name: Build standalone Quest APK
         shell: pwsh
         run: |
