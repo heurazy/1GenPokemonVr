@@ -1,0 +1,20 @@
+{
+  "id": "DRAMATIC_SHAPE",
+  "name": "Dramatic Shape Voxel Mod",
+  "version": "1.5.4-quest.5",
+  "api": 2,
+  "entry": "main.lua",
+  "profile": "content",
+  "category": "GRAPHICS",
+  "game_version": "0.0.0-dev || >=0.1.37 <2.0.0",
+  "priority": 100,
+  "dependencies": [],
+  "optional_dependencies": [],
+  "conflicts": [],
+  "permissions": [
+    "engine_internals"
+  ],
+  "affects_link": false,
+  "description": "Official Dramatic Shape v1.5.4 adapted for standalone Quest through the engine's native Android OpenXR bridge. Keeps the full voxel diorama, first-person mode, battles, day/night, water and PCVR code while applying a mobile stereo render profile.",
+  "github": "DramaticShape/DramaticShapeVoxelMod"
+}

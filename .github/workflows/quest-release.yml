@@ -1,0 +1,68 @@
+name: Quest 3 release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  quest-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Quest Android toolchain
+        shell: pwsh
+        run: |
+          sdkmanager 'platform-tools' 'platforms;android-34' 'build-tools;34.0.0' 'ndk;27.0.12077973'
+
+      - name: Run ROM-free regression tests
+        shell: pwsh
+        run: .\scripts\test-windows.ps1 -Quick
+
+      - name: Build standalone Quest APK
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          .\scripts\build-quest.ps1 -Version $version -Configuration Release
+
+      - name: Prepare release notes and checksum
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $apk = "dist\quest\1GenPokemonVR-Quest3-v$version.apk"
+          if (-not (Test-Path -LiteralPath $apk)) { throw "Missing APK: $apk" }
+          $sha = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToUpperInvariant()
+          "$sha  1GenPokemonVR-Quest3-v$version.apk" | Set-Content -Encoding ascii dist\quest\sha256.txt
+
+          $notes = Get-Content RELEASE_NOTES.md -Raw
+          $marker = "`n---`n"
+          $i = $notes.IndexOf($marker)
+          if ($i -gt 0) { $notes = $notes.Substring(0, $i) }
+          $notes | Set-Content -Encoding utf8 dist\quest\release-body.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 1GenPokemonVR ${{ github.ref_name }} - Quest 3 performance & high refresh
+          body_path: dist/quest/release-body.md
+          prerelease: false
+          files: |
+            dist/quest/1GenPokemonVR-Quest3-${{ github.ref_name }}.apk
+            dist/quest/sha256.txt

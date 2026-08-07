@@ -1,0 +1,298 @@
+-- Title screen (engine/movie/title.asm + engine/menus/main_menu.asm):
+-- the logo (or a text fallback while the asset is missing), a cycling
+-- Pokémon front sprite, the copyright line, and the CONTINUE / NEW GAME
+-- / OPTION / EXIT GAME main menu on START or A.
+
+local Font = require("src.render.Font")
+local Music = require("src.core.Music")
+local GameVersion = require("src.core.GameVersion")
+local Strings = require("src.core.Strings")
+
+local TitleState = {}
+TitleState.__index = TitleState
+TitleState.isOpaque = true
+
+-- SGB title zones (PalPacket_Titlescreen): the logo rows get LOGO2,
+-- the version-ribbon band LOGO1, the rest MEWMON.
+--
+-- The CONTINUE / NEW GAME menu and the continue-info box sit inside those
+-- LOGO bands.  pokered's MainMenu clears the title and runs
+-- RunDefaultPaletteCommand so black UI ink stays black; this port keeps the
+-- title art visible underneath, so without an overlay those boxes inherit
+-- LOGO2 blue / LOGO1 red (issue #133).  A trailing trueColor zone leaves the
+-- overlay's DMG black unshaded while the logo and title mon keep title pals.
+--
+-- ROM SuperPal whites are often {255,239,255}.  Under RED++, LOGO2/MEWMON
+-- come from the GBC pack (pure white) while Blue's LOGO1 stays on the ROM
+-- pack (#128), so the version-ribbon row reads as a pink band.  Force that
+-- slot to pure white; ink colors (Blue/Red "Version" text) stay intact.
+local function withPureWhite(pal)
+  if not pal then return nil end
+  return { { 255, 255, 255 }, pal[2], pal[3], pal[4] }
+end
+
+function TitleState:sgbPalettes(game)
+  local P = require("src.render.PaletteFX")
+  local z = {
+    P.zone(P.pal(game.data, "LOGO2"), 0, 0, 19, 7),
+    P.zone(withPureWhite(P.pal(game.data, "LOGO1")), 0, 8, 19, 9),
+    P.zone(P.pal(game.data, "MEWMON"), 0, 10, 19, 17),
+  }
+  local top = game.stack and game.stack:top()
+  local box = top and top.titleUiBox
+  if box then
+    z[#z + 1] = P.trueColorZone(box[1], box[2], box[3], box[4])
+  end
+  return z[3] and z or nil
+end
+
+-- the Red-version TitleMons list (data/pokemon/title_mons.asm):
+-- TitleScreenPickNewMon draws a random, never-repeating pick from it;
+-- field.title.cycleSpecies replaces it wholesale
+local CYCLE_SPECIES = {
+  "CHARMANDER", "SQUIRTLE", "BULBASAUR", "WEEDLE", "NIDORAN_M", "SCYTHER",
+  "PIKACHU", "CLEFAIRY", "RHYDON", "ABRA", "GASTLY", "DITTO",
+  "PIDGEOTTO", "ONIX", "PONYTA", "MAGIKARP",
+}
+-- Blue's TitleMons (data/pokemon/title_mons.asm, _BLUE branch): STARTER2 is
+-- Squirtle, STARTER1 Charmander, STARTER3 Bulbasaur.
+local BLUE_CYCLE_SPECIES = {
+  "SQUIRTLE", "CHARMANDER", "BULBASAUR", "MANKEY", "HITMONLEE",
+  "VULPIX", "CHANSEY", "AERODACTYL", "JOLTEON", "SNORLAX",
+  "GLOOM", "POLIWAG", "DODUO", "PORYGON", "GENGAR", "RAICHU",
+}
+local CYCLE_FRAMES = 240 -- the original waits ~4s between picks
+
+local function tryImage(path)
+  if not path then return nil end
+  local ok, img = pcall(love.graphics.newImage, path)
+  return ok and img or nil
+end
+
+-- the importer seeds field.title with {path,width,height} descriptors
+-- (the shape IntroMovie unwraps); mod patches may use plain path strings
+local function imagePath(entry)
+  if type(entry) == "table" then return entry.path end
+  return entry
+end
+
+function TitleState.new(game, opts)
+  opts = opts or {}
+  local self = setmetatable({}, TitleState)
+  self.game = game
+  self.onNewGame = opts.onNewGame
+  self.onContinue = opts.onContinue
+  -- branding comes from field.title with the shipped art as fallback, so
+  -- a total conversion rebrands the title without replacing the screen
+  local title = (game.data.field and game.data.field.title) or {}
+  self.title = title
+  self.logo = tryImage(imagePath(title.logo)
+                       or "assets/logo/pokemon_logo.png")
+  -- versionRibbon is the file-12 key; version is the importer's
+  self.version = tryImage(imagePath(title.versionRibbon or title.version)
+                          or "assets/generated/title/red_version.png")
+  self.player = tryImage("assets/generated/title/player.png")
+  self.blue = GameVersion.isBlue()
+  -- Blue cycles its own title mons and prints its ribbon contiguously; a
+  -- field.title.cycleSpecies override (mods / total conversions) still wins.
+  local defaultCycle = self.blue and BLUE_CYCLE_SPECIES or CYCLE_SPECIES
+  self.cycleSpecies = (type(title.cycleSpecies) == "table"
+                       and #title.cycleSpecies > 0)
+                      and title.cycleSpecies or defaultCycle
+  self.sprites = {} -- species -> image or false (load failed)
+  self.cycleIndex = 1
+  self.timer = 0
+  self.blink = 0
+  return self
+end
+
+function TitleState:enter()
+  local data = self.game.data
+  local song = self.title.music or "Music_TitleScreen"
+  if data.audio and data.audio.songs and data.audio.songs[song] then
+    pcall(Music.play, data, song)
+  end
+end
+
+function TitleState:currentSprite()
+  local species = self.cycleSpecies[self.cycleIndex]
+  local cached = self.sprites[species]
+  if cached == nil then
+    local path = require("src.pokemon.Sprites").path(
+      self.game.data, species, "front", { kind = "title" })
+    cached = tryImage(path) or false
+    self.sprites[species] = cached
+  end
+  return cached or nil
+end
+
+local function hasSave()
+  local ok, info = pcall(function()
+    -- the active game's save file (save.lua for Red, save_blue.lua for Blue)
+    local name = require("src.core.SaveData").saveFilename(GameVersion.get())
+    return love.filesystem and love.filesystem.getInfo
+       and love.filesystem.getInfo(name) or nil
+  end)
+  return ok and info ~= nil
+end
+
+-- The CONTINUE info window (main_menu.asm DisplayContinueGameInfo):
+-- PLAYER / BADGES / POKéDEX / TIME over the title, shown after choosing
+-- CONTINUE.  A confirms and loads the game, B returns to the main menu.
+local ContinueInfo = {}
+ContinueInfo.__index = ContinueInfo
+
+function ContinueInfo.new(title, save)
+  -- box at (4,7), 16x10 tiles -- see ContinueInfo:draw / DisplayContinueGameInfo
+  return setmetatable({
+    title = title, game = title.game, save = save,
+    titleUiBox = { 4, 7, 19, 16 },
+  }, ContinueInfo)
+end
+
+function ContinueInfo:update(dt)
+  local input = self.game.input
+  if input:wasPressed("a") then
+    self.game.stack:pop()
+    if self.title.onContinue then self.title.onContinue() end
+  elseif input:wasPressed("b") then
+    self.game.stack:pop()
+    self.title:openMenu()
+  end
+end
+
+function ContinueInfo:draw()
+  local save = self.save
+  -- box at (4,7), 8x14 content; labels double-spaced from (5,9)
+  Font.drawBox(4, 7, 16, 10)
+  love.graphics.setColor(0, 0, 0, 1)
+  Font.draw(Strings("PLAYER"), 40, 72)
+  Font.draw((save.player and save.player.name) or "RED", 96, 72)
+  local badges = require("src.inventory.Badges").count(self.game.data, save)
+  Font.draw(Strings("BADGES"), 40, 88)
+  Font.draw(("%2d"):format(badges), 128, 88)
+  local owned = 0
+  for _ in pairs(save.pokedex and save.pokedex.owned or {}) do
+    owned = owned + 1
+  end
+  Font.draw(Strings("POKéDEX"), 40, 104)
+  Font.draw(("%3d"):format(owned), 120, 104)
+  local t = math.floor(save.playTime or 0)
+  Font.draw(Strings("TIME"), 40, 120)
+  Font.draw(("%3d:%02d"):format(math.floor(t / 3600),
+                                math.floor(t / 60) % 60), 104, 120)
+  love.graphics.setColor(1, 1, 1, 1)
+end
+
+function TitleState:openMenu()
+  local Menu = require("src.ui.Menu")
+  local game = self.game
+  local items = {}
+  if hasSave() then
+    table.insert(items, { label = Strings("CONTINUE"), onSelect = function()
+      -- peek at the save for the info window; fall through if the
+      -- file can't be read
+      local ok, loaded = pcall(require("src.core.SaveData").load)
+      if ok and loaded then
+        game.stack:push(ContinueInfo.new(self, loaded))
+      elseif self.onContinue then
+        self.onContinue()
+      end
+    end })
+  end
+  table.insert(items, { label = Strings("NEW GAME"), onSelect = function()
+    if self.onNewGame then self.onNewGame() end
+  end })
+  table.insert(items, { label = Strings("OPTION"), onSelect = function()
+    require("src.ui.Screens").push(game, "OptionsMenu")
+  end })
+  table.insert(items, { label = Strings("EXIT GAME"), onSelect = function()
+    if love.event and love.event.quit then
+      love.event.quit()
+    end
+  end })
+  local th = #items * 2 + 2
+  local menu = Menu.new(game, items, { tx = 0, ty = 0, tw = 13, th = th })
+  -- full-width title LOGO zones would recolor this box; see sgbPalettes
+  menu.titleUiBox = { 0, 0, 12, th - 1 }
+  game.stack:push(menu)
+end
+
+function TitleState:update(dt)
+  self.timer = self.timer + 1
+  self.blink = (self.blink + 1) % 60
+  if self.timer >= CYCLE_FRAMES then
+    self.timer = 0
+    -- random pick that never repeats the current one
+    if #self.cycleSpecies > 1 then
+      local pick = self.cycleIndex
+      while pick == self.cycleIndex do
+        pick = love.math.random(1, #self.cycleSpecies)
+      end
+      self.cycleIndex = pick
+    end
+    self.slideIn = 20 -- TitleScreenScrollInMon slides the pic in
+  end
+  if self.slideIn and self.slideIn > 0 then
+    self.slideIn = self.slideIn - 1
+  end
+  local input = self.game.input
+  if input:wasPressed("start") or input:wasPressed("a") then
+    -- the title mon cries when you leave the title (.finishedWaiting)
+    require("src.core.Sound").playCry(self.game.data,
+                                      self.cycleSpecies[self.cycleIndex])
+    self:openMenu()
+  end
+end
+
+-- The original tilemap (engine/movie/title.asm): logo at tile (2,1),
+-- the version ribbon at (7,8), Red's title art as OAM at px (82,80),
+-- the title mon in the 7x7 box at tile (5,10), copyright on row 17.
+function TitleState:draw()
+  love.graphics.setColor(1, 1, 1, 1)
+  love.graphics.rectangle("fill", 0, 0, 160, 144)
+  if self.logo then
+    love.graphics.draw(self.logo, 16, 8)
+  else
+    love.graphics.setColor(0, 0, 0, 1)
+    Font.draw(self.blue and "POKéMON BLUE" or Strings("POKéMON RED"),
+      (160 - 12 * 8) / 2, 24)
+    love.graphics.setColor(1, 1, 1, 1)
+  end
+  if self.version then
+    local iw, ih = self.version:getDimensions()
+    if self.blue then
+      -- Blue prints its ribbon contiguously ("Blue Version", hlcoord 7,8).
+      -- The extracted strip packs those eight glyph tiles into image tiles
+      -- 0..7 (tiles 8..9 are blank), so draw that 64px run at px (56, 64).
+      love.graphics.draw(self.version,
+        love.graphics.newQuad(0, 0, 64, 8, iw, ih), 56, 64)
+    else
+      -- Red's strip holds Red+Green+Version glyphs; the tilemap prints
+      -- tiles $60,$61 ("Red"), a space, then $65-$69 ("Version").
+      love.graphics.draw(self.version,
+        love.graphics.newQuad(0, 0, 16, 8, iw, ih), 56, 64)
+      love.graphics.draw(self.version,
+        love.graphics.newQuad(40, 0, 40, 8, iw, ih), 80, 64)
+    end
+  end
+  local sprite = self:currentSprite()
+  if sprite then
+    local w, h = sprite:getDimensions()
+    local slide = (self.slideIn or 0) * 8 -- scroll in from the right
+    -- bottom-aligned and centered in the (5,10)-(11,16) tile box
+    love.graphics.draw(sprite, 40 + math.floor((56 - w) / 2) + slide,
+                       136 - h)
+  end
+  -- Red is OAM in the original: he draws over the mon's box edge
+  if self.player then
+    love.graphics.draw(self.player, 82, 80)
+  end
+  love.graphics.setColor(0, 0, 0, 1)
+  -- the copyright row (tile 2,17); copyrightText because field.title's
+  -- copyright key already names the extracted image strip
+  Font.draw(self.title.copyrightText or Strings("2026 bois club games"), 1, 136)
+  love.graphics.setColor(1, 1, 1, 1)
+end
+
+return TitleState

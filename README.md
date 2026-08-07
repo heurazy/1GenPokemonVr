@@ -14,11 +14,13 @@ Blue ROM during the first launch.
 
 - Native stereo OpenXR rendering with 6DoF head tracking.
 - Standalone Quest 3/3S APK with no PC or Link connection required.
+- Quest display-rate selection at 72 / 80 / 90 / 120 Hz (90 Hz default),
+  driven by OpenXR rather than the desktop 60 FPS limiter.
 - Meta Touch, Valve Index, HTC Vive and Windows Mixed Reality bindings.
 - Ray pointer and draggable browser-style scrollbars in menus.
 - Immersive, orbit, overhead and first-person cameras.
-- Adjustable world scale, view distance, pitch, height, X/Z offset and head
-  motion strength under **START -> VR OPTION**.
+- Adjustable world scale, Quest draw distance (20-36 m), render quality,
+  display rate, turning and comfort settings under **START -> VR OPTION**.
 - Head-relative first-person movement: pushing forward moves in the direction
   you are looking, snapped to Pokemon's four-direction movement grid.
 - Spatial battles with separate battlefield, opponent, attack, player and HUD
@@ -116,16 +118,26 @@ later launches start directly. Press `F8` to recenter.
 See [`docs/vr.md`](docs/vr.md) for prerequisites, build details, controls and
 the renderer architecture.
 
-## Standalone Quest 3 / 3S preview
+## Standalone Quest 3 / 3S
 
-Install the Quest APK with Meta Quest Developer Hub or `adb install -r`, then
-launch **1GenPokemonVR Quest** from Unknown Sources. The first-run ROM chooser
-is a spatial panel controlled with the right Touch controller ray.
+The current standalone release is **v0.2.39**. Download
+`1GenPokemonVR-Quest3-v0.2.39.apk` from the GitHub Releases page, install it
+with Meta Quest Developer Hub or `adb install -r`, then launch
+**1GenPokemonVR Quest** from Unknown Sources. The first-run ROM chooser is a
+spatial panel controlled with the right Touch controller ray.
 
-The standalone build uses an opaque immersive VR environment. Camera position,
-world scale, view distance, height and offset remain adjustable under
-**START -> VR OPTION**. See [`docs/quest.md`](docs/quest.md) for installation
-and build details.
+The Quest profile uses a 28 m draw distance, 75% stereo render scale, SKY water
+and shadows off by default. **START -> VR OPTION** exposes draw distance,
+render quality, 72/80/90/120 Hz display rate, world size, player height and
+turning controls. The engine keeps gameplay simulation at 60 ticks/s while
+OpenXR independently presents head/controller tracking and stereo frames at the
+selected headset refresh rate.
+
+Recent Quest performance work includes grass chunk culling, distant-detail and
+connected-map culling, directional wall-face submission, and removal of
+redundant reflection work. See [`docs/quest.md`](docs/quest.md) for installation
+and build details and [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the complete
+v0.2.39 summary.
 
 ## Portable Mode
 
@@ -175,7 +187,7 @@ Shipped example mods, one per kind of author, live in [`mods/`](mods/).
 
 - [bryanthaboi/gen1recomp](https://github.com/bryanthaboi/gen1recomp) for the
   native Lua/LÖVE Generation 1 recompilation.
-- [Dramatic Shape Voxel Mod v1.4.0](https://github.com/DramaticShape/DramaticShapeVoxelMod/releases/tag/v1.4.0)
+- [Dramatic Shape Voxel Mod v1.5.4](https://github.com/DramaticShape/DramaticShapeVoxelMod/releases/tag/v1.5.4)
   for the voxel-world project and visual foundation.
 
 The OpenXR integration, VR input, spatial UI and layered battle presentation

@@ -1,0 +1,864 @@
+-- Two-pass renderer.  The UI pass is the classic 160x144 Game Boy canvas
+-- drawn at the integer window fit scale S, letterboxed in the window.
+-- The world pass (overworld survey zoom) is a variable-size canvas that
+-- fills the *entire* window at the effective integer scale s',  so black
+-- letterbox voids become more map, not empty bars.  Both use nearest-
+-- neighbor filtering.
+-- Spec: docs/new-features.md (survey zoom)
+
+local Zoom = require("src.render.Zoom")
+local Tilt = require("src.render.Tilt")
+local PaletteFX = require("src.render.PaletteFX")
+local Pipelines = require("src.render.Pipelines")
+local PixelCanvas = require("src.render.PixelCanvas")
+local Runtime = require("src.mods.Runtime")
+local OpenXR = require("src.vr.OpenXR")
+local VRPointer = require("src.vr.Pointer")
+
+local Renderer = {}
+
+Renderer.WIDTH = 160
+Renderer.HEIGHT = 144
+
+-- Whether a value is a real Canvas we can composite.  Real LOVE canvases are
+-- userdata answering typeOf("Canvas"); the headless test stub fakes them as
+-- tables carrying the Canvas method shape.  A mod pipeline handing back a
+-- non-canvas must be rejected before it reaches love.graphics.draw, which
+-- would otherwise take the frame down with it.
+local function isCanvas(v)
+  if type(v) == "userdata" then
+    return type(v.typeOf) == "function" and v:typeOf("Canvas") == true
+  end
+  if type(v) == "table" then
+    return type(v.getWidth) == "function" and type(v.getHeight) == "function"
+  end
+  return false
+end
+
+-- Tilt mode: the upright billboard canvas is grown by this many world
+-- pixels on every side beyond the ground world view, so a structure or
+-- sprite standing near a view edge still draws in full instead of being
+-- clipped where the ground canvas ends (a receding tree wall at the top of
+-- the view rises above row 0; a fence at the bottom-left drops below/left).
+-- endFrame composites the padded canvas back with a matching offset.
+Renderer.UPRIGHT_MARGIN = 160
+
+-- LOVE units + framebuffer pixels + per-axis unit→pixel ratios.
+-- Android's DisplayMetrics.density is often non-integer (1.5, 2.75, …).
+-- Integer scaling in units then maps each GB pixel to a fractional number of
+-- framebuffer pixels → shimmer, uneven / non-square "pixels", and movement
+-- judder (issue #87).  Always derive the crisp integer scale from the
+-- *drawable* pixel size (the window framebuffer we present into -- not a
+-- combined multi-display metric), then draw with (pixels / axisDpi) so the
+-- GPU lands on whole framebuffer pixels.  Desktop dpi=1 is unchanged.
+--
+-- LOVE's projection is anisotropic: 1 unit in X covers pw/ww framebuffer
+-- pixels and 1 unit in Y covers ph/wh.  Those ratios match on a normal
+-- highdpi surface, but diverge when unit sizes are truncated independently
+-- (`(int)(pixels/density)`) or when a dual-screen / forced-rotation device
+-- reports mismatched unit vs drawable aspects (AYN Thor, issue #208).
+-- love.graphics.getDPIScale() is only ph/wh, so using it (or pw/ww alone)
+-- for both axes makes the other axis land on a fractional, stretched count.
+-- Keep separate dpiX/dpiY so each GB pixel covers fitScale() physical pixels
+-- on BOTH axes (square).
+local function displayMetrics()
+  local ww, wh = love.graphics.getDimensions()
+  local pw, ph = ww, wh
+  if love.graphics.getPixelDimensions then
+    pw, ph = love.graphics.getPixelDimensions()
+  end
+  local dpiX, dpiY = 1, 1
+  if ww > 0 and pw > 0 then dpiX = pw / ww end
+  if wh > 0 and ph > 0 then dpiY = ph / wh end
+  -- No pixel API (headless / old stub): fall back to getDPIScale, else 1.
+  if (dpiX == 1 and dpiY == 1) and not love.graphics.getPixelDimensions
+     and love.graphics.getDPIScale then
+    local d = love.graphics.getDPIScale()
+    if d and d > 1e-6 then dpiX, dpiY = d, d end
+  end
+  if dpiX < 1e-6 then dpiX = 1 end
+  if dpiY < 1e-6 then dpiY = 1 end
+  return ww, wh, pw, ph, dpiX, dpiY
+end
+
+local function releaseCanvas(canvas)
+  if canvas and canvas.release then pcall(canvas.release, canvas) end
+end
+
+function Renderer:init()
+  -- 160x144 real pixels, never DPI-scaled: see src/render/PixelCanvas.lua
+  -- (#208).  Every canvas below is sized in framebuffer pixels for the same
+  -- reason -- worldViewSize() already works in drawable pixels.
+  self.canvas = PixelCanvas.new(self.WIDTH, self.HEIGHT, "nearest")
+  self.vrUICanvas = nil
+  self.worldCanvas = nil
+  self.worldActive = false
+  -- tilt mode only: a transparent overlay canvas the size of the world
+  -- canvas that receives the upright billboard pass (sprites + standing
+  -- FX, drawn at their projected ground anchors).  It composites flat over
+  -- the projected ground in endFrame; never touched while tilt is off.
+  self.uprightCanvas = nil
+  self.uprightActive = false
+  -- a render pipeline's finished world image, already at window resolution
+  -- (see src/render/Pipelines.lua).  nil is "no pipeline rendered this
+  -- frame", which is every vanilla frame.
+  self.worldOverride = nil
+end
+
+-- A title/menu -> loaded-overworld transition changes every major VR surface
+-- in one frame. Release the old flat/menu targets before the voxel eyes and
+-- map meshes allocate, otherwise both generations coexist until Lua's GC
+-- eventually finalizes them. On Quest that transient peak can make the
+-- runtime dismiss the immersive app even though the Lua process survives.
+function Renderer:resetVRTransition()
+  if love.graphics and love.graphics.setCanvas then
+    pcall(love.graphics.setCanvas)
+  end
+  for _, name in ipairs({
+    "worldCanvas", "uprightCanvas", "tiltCanvas", "presentCanvas",
+    "vrDeviceCanvas", "vrUICanvas", "vrBattleCanvas",
+  }) do
+    releaseCanvas(self[name])
+    self[name] = nil
+  end
+  if self.vrBattleDepthCanvases then
+    for _, canvas in pairs(self.vrBattleDepthCanvases) do
+      releaseCanvas(canvas)
+    end
+  end
+  self.vrBattleDepthCanvases = nil
+  self.worldActive = false
+  self.uprightActive = false
+  self.worldOverride = nil
+  self.worldFadeAlpha = nil
+  self.battleCascadeProg = nil
+  self.vrBattle = false
+  self.vrBattleState = nil
+  OpenXR.setInWorldUI(false)
+  OpenXR.cancelFrame()
+end
+
+-- Hand endFrame a pipeline's world image to composite instead of the world
+-- canvas.  Cleared every frame, so a pipeline that declines one frame falls
+-- straight back to the 2D path rather than showing a stale image.
+function Renderer:setWorldOverride(canvas)
+  -- Defensive: a pipeline that hands back a non-canvas (forgotten return, a
+  -- truthy sentinel) must not reach the worldOverride blit in endFrame, where
+  -- love.graphics.draw on it would crash the frame.  Reject it and fall back
+  -- to the 2D path rather than trust it.
+  if canvas ~= nil and not isCanvas(canvas) then canvas = nil end
+  self.worldOverride = canvas
+end
+
+-- Integer framebuffer pixels per GB pixel that fit the window.  Zoom /
+-- GBCFX / callers treat this as the crisp scale; endFrame converts to LOVE
+-- units via / dpiX and / dpiY when drawing.
+function Renderer:fitScale()
+  local _, _, pw, ph = displayMetrics()
+  return math.max(1, math.floor(math.min(pw / self.WIDTH, ph / self.HEIGHT)))
+end
+
+-- LOVE-unit draw scales endFrame uses for the UI blit: integer framebuffer
+-- scale (fitScale) divided by each axis's unit→pixel factor, so a GB pixel
+-- lands on fitScale() whole PHYSICAL pixels on both axes once LOVE applies
+-- its projection (fitScale() == drawScaleX() * dpiX == drawScaleY() * dpiY).
+-- Exposed for #208's regression (square pixels when dpiX ≠ dpiY).
+function Renderer:drawScaleX()
+  local _, _, _, _, dpiX = displayMetrics()
+  return self:fitScale() / dpiX
+end
+
+function Renderer:drawScaleY()
+  local _, _, _, _, _, dpiY = displayMetrics()
+  return self:fitScale() / dpiY
+end
+
+-- Back-compat alias: uniform surfaces have drawScaleX == drawScaleY.
+function Renderer:drawScale()
+  return self:drawScaleX()
+end
+
+-- world-pass canvas size in world pixels: enough to fill the drawable at s'.
+-- Sized from framebuffer pixels (not unit dims) so anisotropic dpiX/dpiY
+-- cannot over/under-cover the window.  In tilt mode the canvas grows (both
+-- dimensions, by Tilt.viewGrowth) so the projected ground plane still covers
+-- the whole window with no background peeking at the receded top/bottom
+-- corners; flat mode returns exactly today's size (growth factor is 1 when
+-- tilt is inactive).
+function Renderer:worldViewSize()
+  local _, _, pw, ph = displayMetrics()
+  local sp = Zoom.scale(self:fitScale())
+  local vw, vh = math.ceil(pw / sp), math.ceil(ph / sp)
+  -- Even sizes keep Camera:follow on integer pixels (viewW/2 is integral),
+  -- so unfloored FX/sprite math cannot phase-shimmer against the tile layer.
+  if vw % 2 ~= 0 then vw = vw + 1 end
+  if vh % 2 ~= 0 then vh = vh + 1 end
+  if Tilt.active() then
+    local g = Tilt.viewGrowth()
+    vw, vh = math.ceil(vw * g), math.ceil(vh * g)
+  end
+  return vw, vh
+end
+
+-- transparent: the world pass shows through (UI pass draws overlays only)
+function Renderer:beginFrame(transparent)
+  self.worldActive = false
+  self.uprightActive = false
+  self.worldOverride = nil
+  -- warp-fade overlay from Transition (issue #121); cleared each frame so
+  -- a popped transition cannot leave a sticky black veil
+  self.worldFadeAlpha = nil
+  -- battle-transition cascade outside the 160x144 wipe (BattleTransition)
+  self.battleCascadeProg = nil
+  -- last frame's trueColor rects and sprite redraws go before anything
+  -- draws this one
+  PaletteFX.clearTrueColor()
+  PaletteFX.clearSpriteRedraws()
+  PaletteFX.setPass("ui")
+  love.graphics.setCanvas(self.canvas)
+  if transparent then
+    love.graphics.clear(0, 0, 0, 0)
+  else
+    love.graphics.clear(1, 1, 1, 1)
+  end
+end
+
+-- Black 8x8 (scaled) blocks cascading outward from the classic GB letterbox
+-- into the surrounding window, matching BattleTransition wipe progress.
+-- Tiles that sit entirely inside the 160x144 square are left to the OG wipe.
+-- Sx/Sy are LOVE-unit scales (Sy defaults to Sx on uniform surfaces).
+function Renderer:drawBattleCascade(prog, ww, wh, ox, oy, vpw, vph, Sx, Sy)
+  if not prog or prog <= 0 then return end
+  Sy = Sy or Sx
+  local TILE_W, TILE_H = 8 * Sx, 8 * Sy
+  if TILE_W < 1 then TILE_W = 1 end
+  if TILE_H < 1 then TILE_H = 1 end
+  local cols = math.ceil(ww / TILE_W)
+  local rows = math.ceil(wh / TILE_H)
+  local cx, cy = ox + vpw / 2, oy + vph / 2
+  local order = {}
+  for row = 0, rows - 1 do
+    for col = 0, cols - 1 do
+      local x, y = col * TILE_W, row * TILE_H
+      -- any tile with area outside the letterbox participates
+      if x < ox or y < oy or x + TILE_W > ox + vpw or y + TILE_H > oy + vph then
+        local dist = math.max(math.abs(x + TILE_W / 2 - cx),
+                              math.abs(y + TILE_H / 2 - cy))
+        order[#order + 1] = { x, y, dist }
+      end
+    end
+  end
+  if #order == 0 then return end
+  table.sort(order, function(a, b)
+    if a[3] ~= b[3] then return a[3] < b[3] end
+    if a[2] ~= b[2] then return a[2] < b[2] end
+    return a[1] < b[1]
+  end)
+  local n = math.floor(#order * math.min(1, prog) + 1e-6)
+  if prog >= 1 then n = #order end
+  love.graphics.setColor(0, 0, 0, 1)
+  love.graphics.setScissor(0, 0, ww, wh)
+  for i = 1, n do
+    local t = order[i]
+    love.graphics.rectangle("fill", t[1], t[2], TILE_W, TILE_H)
+  end
+  love.graphics.setScissor()
+  love.graphics.setColor(1, 1, 1, 1)
+end
+
+function Renderer:beginWorldPass()
+  local vw, vh = self:worldViewSize()
+  if not self.worldCanvas or self.worldCanvas:getWidth() ~= vw
+     or self.worldCanvas:getHeight() ~= vh then
+    -- free the old canvas before replacing it: a zoom/tilt tween changes
+    -- the view size every frame, so without this the superseded canvases
+    -- pile up in VRAM until a GC finalizer happens to run
+    if self.worldCanvas and self.worldCanvas.release then self.worldCanvas:release() end
+    self.worldCanvas = PixelCanvas.new(vw, vh, "nearest")
+  end
+  self.worldActive = true
+  PaletteFX.setPass("world")
+  love.graphics.setCanvas(self.worldCanvas)
+  love.graphics.clear(1, 1, 1, 1)
+end
+
+function Renderer:endWorldPass()
+  PaletteFX.setPass("ui")
+  love.graphics.setCanvas(self.canvas)
+end
+
+-- Tilt mode's upright pass: standing things (sprites, tall-grass feet
+-- overdraw, screen-anchored FX) draw here instead of into the ground
+-- world canvas, each already projected to its ground anchor and colorized
+-- with its map's SGB palette (see OverworldController:billboard).  The
+-- canvas is transparent so the projected ground shows through the gaps;
+-- endFrame blits it flat over the projected ground.  Sized/filtered like
+-- the world canvas but kept separate so the ground can be projected as a
+-- plane while these stay upright.  Only entered while Tilt.active().
+function Renderer:beginUprightPass()
+  local vw, vh = self:worldViewSize()
+  local M = self.UPRIGHT_MARGIN
+  local cw, ch = vw + 2 * M, vh + 2 * M
+  if not self.uprightCanvas or self.uprightCanvas:getWidth() ~= cw
+     or self.uprightCanvas:getHeight() ~= ch then
+    if self.uprightCanvas and self.uprightCanvas.release then self.uprightCanvas:release() end
+    self.uprightCanvas = PixelCanvas.new(cw, ch, "nearest")
+  end
+  self.uprightActive = true
+  PaletteFX.setPass(nil)
+  love.graphics.setCanvas(self.uprightCanvas)
+  love.graphics.clear(0, 0, 0, 0)
+  -- shift the whole pass into the padded canvas so billboards keep drawing
+  -- in flat world-canvas coordinates (0..vw, 0..vh) while the margin catches
+  -- anything that overhangs an edge; endFrame undoes it with the same offset
+  love.graphics.push()
+  love.graphics.translate(M, M)
+end
+
+-- return to the ground world canvas (the world pass owns it until draw()
+-- calls endWorldPass)
+function Renderer:endUprightPass()
+  PaletteFX.setPass("world")
+  love.graphics.pop()
+  love.graphics.setCanvas(self.worldCanvas)
+end
+
+-- Perspective mesh shader for tilt mode.  The mesh already carries CPU-
+-- projected 2D corner positions (from Tilt.groundPoint), so the vertex
+-- stage does no projection; instead it passes each corner's depthScale as
+-- the per-vertex "q" and pre-multiplies the texture coords by it.  The
+-- fragment divides back, which reconstructs perspective-correct texture
+-- interpolation across the whole quad (no affine-warp seams) using the
+-- exact same projection the billboards will anchor to.  false = headless /
+-- no shader support, in which case the renderer stays on the flat blit.
+local TILT_SHADER = [[
+  varying float vScale;
+#ifdef VERTEX
+  attribute float VertexScale;
+  vec4 position(mat4 transform_projection, vec4 vertex_position) {
+    vScale = VertexScale;
+    VaryingTexCoord = vec4(VertexTexCoord.xy * VertexScale, 0.0, 1.0);
+    return transform_projection * vertex_position;
+  }
+#endif
+#ifdef PIXEL
+  vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+    return Texel(tex, tc / vScale) * color;
+  }
+#endif
+]]
+
+function Renderer:tiltShader()
+  if self._tiltShader == nil then
+    local ok, sh = pcall(love.graphics.newShader, TILT_SHADER)
+    self._tiltShader = ok and sh or false
+  end
+  return self._tiltShader or nil
+end
+
+-- Dynamic 4-vertex ground quad; positions/depthScale are refreshed each
+-- frame from Tilt.meshCorners.  The custom VertexScale attribute rides the
+-- perspective "q" through to the shader above.
+function Renderer:tiltMesh()
+  if self._tiltMesh == nil then
+    local format = {
+      { "VertexPosition", "float", 2 },
+      { "VertexTexCoord", "float", 2 },
+      { "VertexScale", "float", 1 },
+    }
+    local ok, mesh = pcall(love.graphics.newMesh, format, 4, "fan", "dynamic")
+    self._tiltMesh = ok and mesh or false
+  end
+  return self._tiltMesh or nil
+end
+
+-- Draw the world pass through the tilt projection.  Two steps: (1) a
+-- canvas-to-canvas palette pre-pass that bakes the SGB world zones into a
+-- colorized ground canvas in flat space (a perspective transform breaks
+-- the rectangular scissors endFrame normally uses), then (2) project that
+-- canvas onto the tilted plane via the perspective mesh, scaled/centred
+-- exactly like the flat world blit.  `target` is the canvas to project
+-- into (nil = default framebuffer; presentCanvas when CRT is on).
+-- Returns true on success; false (no shader/mesh) tells endFrame to fall
+-- back to the flat blit unchanged.
+function Renderer:drawTiltedWorld(zoneList, sx, sy, wox, woy, target)
+  local shader = self:tiltShader()
+  local mesh = self:tiltMesh()
+  if not (shader and mesh) then return false end
+  sy = sy or sx
+  local wvw = self.worldCanvas:getWidth()
+  local wvh = self.worldCanvas:getHeight()
+
+  -- colorized ground canvas, resized to match the world canvas.  Linear
+  -- sampling softens the pixel shimmer the perspective warp would cause
+  -- (the flat path keeps nearest).  TODO(tilt): optionally render this at
+  -- 2x for extra crispness.
+  if not self.tiltCanvas or self.tiltCanvas:getWidth() ~= wvw
+     or self.tiltCanvas:getHeight() ~= wvh then
+    if self.tiltCanvas and self.tiltCanvas.release then self.tiltCanvas:release() end
+    self.tiltCanvas = PixelCanvas.new(wvw, wvh, "linear")
+  end
+
+  love.graphics.setCanvas(self.tiltCanvas)
+  love.graphics.clear(1, 1, 1, 1)
+  love.graphics.setColor(1, 1, 1, 1)
+  local zoneShader = zoneList and zoneList[1] and PaletteFX.shader() or nil
+  if zoneShader then
+    love.graphics.setShader(zoneShader)
+    -- same trueColor sentinel the flat blit honors (14 §trueColor)
+    local bare = false
+    for _, z in ipairs(zoneList) do
+      local plain = z.colors == false
+      if plain ~= bare then
+        bare = plain
+        love.graphics.setShader(not plain and zoneShader or nil)
+      end
+      if not plain then PaletteFX.sendColors(zoneShader, z.colors) end
+      local x, y = math.max(0, z.x), math.max(0, z.y)
+      local x2, y2 = math.min(wvw, z.x + z.w), math.min(wvh, z.y + z.h)
+      if x2 > x and y2 > y then
+        love.graphics.setScissor(x, y, x2 - x, y2 - y)
+        love.graphics.draw(self.worldCanvas, 0, 0)
+      end
+    end
+    love.graphics.setScissor()
+    love.graphics.setShader()
+  else
+    love.graphics.draw(self.worldCanvas, 0, 0)
+  end
+
+  -- project onto the tilted plane into the present target (or screen)
+  love.graphics.setCanvas(target)
+  mesh:setTexture(self.tiltCanvas)
+  mesh:setVertices(Tilt.meshCorners(wvw, wvh))
+  love.graphics.push()
+  love.graphics.translate(wox, woy)
+  love.graphics.scale(sx, sy)
+  love.graphics.setColor(1, 1, 1, 1)
+  love.graphics.setShader(shader)
+  love.graphics.draw(mesh)
+  love.graphics.setShader()
+  love.graphics.pop()
+  return true
+end
+
+-- clamp a scissor rect to the viewport box
+local function scissorClamped(x, y, w, h, ox, oy, vpw, vph)
+  local x2, y2 = math.min(x + w, ox + vpw), math.min(y + h, oy + vph)
+  x, y = math.max(x, ox), math.max(y, oy)
+  if x2 <= x or y2 <= y then return false end
+  love.graphics.setScissor(x, y, x2 - x, y2 - y)
+  return true
+end
+
+-- Splice the pass's trueColor rects (reported by the renderers that drew
+-- a record carrying the flag) onto the end of its zone list, so each one
+-- re-blits its region with no shader over the colorized pass.  An absent
+-- or empty zone list is left alone: that already draws the whole canvas
+-- unshaded, which is what the rects were asking for.
+local function withTrueColor(zoneList, pass)
+  local rects = PaletteFX.trueColorRects(pass)
+  if not (rects[1] and zoneList and zoneList[1]) then return zoneList end
+  local merged = {}
+  for i = 1, #zoneList do merged[i] = zoneList[i] end
+  for i = 1, #rects do merged[#merged + 1] = rects[i] end
+  return merged
+end
+
+-- zones: optional list of SGB palette regions (see PaletteFX) in
+-- 160x144 UI space, applied to the UI pass.  worldZones: optional
+-- regions in world-canvas pixels (overworld survey zoom colors each
+-- visible map area separately), applied to the world pass; the world
+-- pass falls back to the UI zones when absent.  Each zone is drawn
+-- scissored through the shade-remap shader, later zones on top.
+-- When GBC FX is active the composite is drawn into presentCanvas and
+-- presented through the GBC FX shader as a final pass.
+function Renderer:endFrame(zones, worldZones)
+  love.graphics.setCanvas()
+  local ww, wh, pw, ph, dpiX, dpiY = displayMetrics()
+  -- Sp = integer framebuffer pixels per GB pixel;
+  -- Sx/Sy = LOVE-unit draw scales (may differ when dpiX ≠ dpiY).
+  local Sp = self:fitScale()
+  local Sx, Sy = Sp / dpiX, Sp / dpiY
+  local vpw, vph = self.WIDTH * Sx, self.HEIGHT * Sy
+  -- Snap the letterbox origin to a framebuffer pixel, then convert to units.
+  local ox = math.floor((pw - self.WIDTH * Sp) / 2) / dpiX
+  local oy = math.floor((ph - self.HEIGHT * Sp) / 2) / dpiY
+  local GBCFX = require("src.render.GBCFX")
+  -- Forced mono/Classic modes still need a whole-screen zone when a state
+  -- exposes no SGB packets (raw DMG canvas), so sendColors can remap.
+  zones = PaletteFX.ensureZones(zones)
+  if worldZones then worldZones = PaletteFX.ensureZones(worldZones) end
+  -- the UI rects are in 160x144 canvas space and the world rects in world-
+  -- canvas pixels, matching the zone list each is appended to.  A world
+  -- pass with no world zones falls back to the UI list, whose coordinate
+  -- space the world rects are not in, so they are dropped there.
+  zones = withTrueColor(zones, "ui")
+  worldZones = withTrueColor(worldZones, "world")
+
+  -- A post-process pipeline needs the whole composite in a canvas for the
+  -- same reason GBC FX does, so either one alone is enough to take the
+  -- present path; with neither, the frame draws straight to the screen
+  -- exactly as it always did.
+  local needPresent = GBCFX.active() or Pipelines.wantsPresent()
+  local present = nil
+  if needPresent then
+    if not self.presentCanvas or self.presentCanvas:getWidth() ~= ww
+       or self.presentCanvas:getHeight() ~= wh then
+      -- The one canvas NOT built through PixelCanvas: it is sized in LOVE
+      -- units and blitted back at unit scale 1 (and handed to mod present
+      -- passes as ww x wh), so it has to keep the screen's DPI scale for its
+      -- texture to cover the framebuffer.  Everything composited into it is
+      -- already native-resolution now, so #208's fractional source is gone;
+      -- what remains here is the dpiX vs dpiY truncation gap (well under 1%,
+      -- one seam across the window) that a single scalar dpiscale cannot
+      -- express.
+      self.presentCanvas = love.graphics.newCanvas(ww, wh)
+      self.presentCanvas:setFilter("linear", "linear")
+    end
+    present = self.presentCanvas
+    love.graphics.setCanvas(present)
+  end
+  -- Default letterbox is black.  Battle (and any state that opts in via
+  -- letterboxWhite) fills the voids white so the window matches the
+  -- white battle canvas instead of showing black bars.
+  local clearR, clearG, clearB = 0, 0, 0
+  if not self.worldActive then
+    local ok, Game = pcall(require, "src.core.Game")
+    local stack = ok and Game and Game.stack
+    local base = stack and stack.visibleBase and stack:visibleBase()
+    local state = base and stack.states and stack.states[base]
+    if state and state.letterboxWhite then
+      clearR, clearG, clearB = 1, 1, 1
+    end
+  end
+  love.graphics.setColor(clearR, clearG, clearB, 1)
+  love.graphics.rectangle("fill", 0, 0, ww, wh)
+  love.graphics.setColor(1, 1, 1, 1)
+  -- render.letterbox: SGB borders / custom void art in the bars around the
+  -- 160x144 (or world) blit.  Drawn after the clear and before the game
+  -- canvas so the playfield sits on top of the border.
+  if Runtime.wantsHook("render.letterbox") then
+    Runtime.call("render.letterbox", function() end, {
+      ww = ww, wh = wh, pw = pw, ph = ph,
+      ox = ox, oy = oy, vpw = vpw, vph = vph,
+      scale = Sp, dpiX = dpiX, dpiY = dpiY,
+      worldActive = self.worldActive and true or false,
+    })
+  end
+
+  -- blit `canvas` at (sx, sy) LOVE-unit scales into origin (bx, by),
+  -- scissored to the (boxX, boxY, boxW, boxH) screen rect.  zoneSx/zoneSy
+  -- convert zone coords (canvas-space) into screen units.
+  local function blit(canvas, sx, sy, zoneList, zoneSx, zoneSy,
+                      bx, by, boxX, boxY, boxW, boxH)
+    local shader = zoneList and zoneList[1] and PaletteFX.shader() or nil
+    if not shader then
+      love.graphics.setScissor(boxX, boxY, boxW, boxH)
+      love.graphics.draw(canvas, bx, by, 0, sx, sy)
+      love.graphics.setScissor()
+      return
+    end
+    love.graphics.setShader(shader)
+    -- a colors == false zone is the trueColor opt-out: its rect draws with
+    -- no shader at all.  Nothing sets one without a mod, so a vanilla zone
+    -- list never toggles and issues exactly the calls it always did.
+    local bare = false
+    for _, z in ipairs(zoneList) do
+      local plain = z.colors == false
+      if plain ~= bare then
+        bare = plain
+        love.graphics.setShader(not plain and shader or nil)
+      end
+      if not plain then PaletteFX.sendColors(shader, z.colors) end
+      if scissorClamped(bx + z.x * zoneSx, by + z.y * zoneSy,
+                        z.w * zoneSx, z.h * zoneSy,
+                        boxX, boxY, boxW, boxH) then
+        love.graphics.draw(canvas, bx, by, 0, sx, sy)
+      end
+    end
+    love.graphics.setScissor()
+    love.graphics.setShader()
+  end
+
+  -- Quest's official voxel VR path must run after the complete state stack
+  -- has drawn: an opaque battle hides the overworld draw call, but the
+  -- headset still needs that world rendered once per eye.  Give the OpenXR
+  -- owner a current, colorized 160x144 device texture and let it return a
+  -- side-by-side projection image.  Desktop and mod-free builds skip this
+  -- whole block in one predicate.
+  if OpenXR.hasWorldRenderer and OpenXR.hasWorldRenderer()
+      and OpenXR.isActive() then
+    if not self.vrDeviceCanvas then
+      self.vrDeviceCanvas = love.graphics.newCanvas(
+        self.WIDTH, self.HEIGHT, { dpiscale = 1 })
+      self.vrDeviceCanvas:setFilter("nearest", "nearest")
+    end
+    local previous = love.graphics.getCanvas()
+    love.graphics.setCanvas(self.vrDeviceCanvas)
+    love.graphics.clear(0, 0, 0, 0)
+    love.graphics.setColor(1, 1, 1, 1)
+    blit(self.canvas, 1, 1, zones, 1, 1,
+         0, 0, 0, 0, self.WIDTH, self.HEIGHT)
+    love.graphics.push("all")
+    love.graphics.setBlendMode("alpha")
+    VRPointer.draw()
+    love.graphics.pop()
+    if love.graphics.flushBatch then love.graphics.flushBatch() end
+    love.graphics.setCanvas(previous)
+
+    local override = OpenXR.renderWorld(
+      self, zones, worldZones, self.vrDeviceCanvas)
+    if override then self.worldOverride = override end
+  end
+
+  if self.worldOverride then
+    -- A render pipeline already produced the whole world -- terrain,
+    -- characters and its own FX overlay -- as one window-resolution image,
+    -- so it composites with a straight 1:1 blit and the world canvas is
+    -- skipped entirely (nothing drew into it).  The UI blit below still
+    -- runs, so dialogs, menus and the HUD sit on top as usual.
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setScissor(0, 0, ww, wh)
+    love.graphics.draw(self.worldOverride, 0, 0, 0, 1 / dpiX, 1 / dpiY)
+    love.graphics.setScissor()
+    -- the screen-space overlays the flat path draws over its composite
+    local fade = self.worldFadeAlpha
+    if fade and fade > 0 then
+      love.graphics.setColor(0, 0, 0, fade)
+      love.graphics.rectangle("fill", 0, 0, ww, wh)
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+    if self.battleCascadeProg then
+      self:drawBattleCascade(self.battleCascadeProg, ww, wh, ox, oy, vpw, vph, Sx, Sy)
+    end
+  elseif self.worldActive and OpenXR.isActive() then
+    -- A freshly enabled voxel pipeline may spend a few frames building its
+    -- first terrain mesh and deliberately fall back to the flat world.
+    -- Duplicate that fallback into both eyes; stretching one mono canvas
+    -- across the full side-by-side target would give each eye a different
+    -- half of the map until the stereo geometry is ready.
+    local eyeW = ww / 2
+    local wvw, wvh = self.worldCanvas:getDimensions()
+    local s = math.min(eyeW / wvw, wh / wvh)
+    local drawW, drawH = wvw * s, wvh * s
+    for eye = 0, 1 do
+      local eyeX = eye * eyeW
+      local bx = eyeX + (eyeW - drawW) / 2
+      local by = (wh - drawH) / 2
+      blit(self.worldCanvas, s, s, worldZones, s, s,
+           bx, by, eyeX, 0, eyeW, wh)
+    end
+    local fade = self.worldFadeAlpha
+    if fade and fade > 0 then
+      love.graphics.setColor(0, 0, 0, fade)
+      love.graphics.rectangle("fill", 0, 0, ww, wh)
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+  elseif self.worldActive then
+    local sp = Zoom.scale(Sp)
+    local sx, sy = sp / dpiX, sp / dpiY
+    local wvw = self.worldCanvas:getWidth()
+    local wvh = self.worldCanvas:getHeight()
+    local wox = math.floor((pw - wvw * sp) / 2) / dpiX
+    local woy = math.floor((ph - wvh * sp) / 2) / dpiY
+    -- Tilt mode projects the ground world pass through the perspective mesh
+    -- (SGB zones baked in beforehand -- see drawTiltedWorld -- so no zone
+    -- scissoring here).  drawTiltedWorld returns false when tilt is off or
+    -- projection is unavailable (headless / no shader); then the ground
+    -- falls through to the flat blit, keeping the flat frame byte-for-byte
+    -- identical to today.
+    local projected =
+      Tilt.active() and self:drawTiltedWorld(worldZones or zones, sx, sy, wox, woy, present)
+    if not projected then
+      if worldZones then
+        blit(self.worldCanvas, sx, sy, worldZones, sx, sy, wox, woy, 0, 0, ww, wh)
+      else
+        blit(self.worldCanvas, sx, sy, zones, Sx, Sy, wox, woy, 0, 0, ww, wh)
+      end
+      -- OBP-baked overworld sprites replay on top of the zone pass (GBC
+      -- mode per-object coloring; see PaletteFX.markSpriteRedraw).  Grass
+      -- feet-overdraw entries carry `colors` and re-colorize through the
+      -- color-0-keyed shade-remap shader so they keep hiding sprite feet.
+      local redraws = PaletteFX.spriteRedraws()
+      if redraws[1] then
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.setScissor(0, 0, ww, wh)
+        local activeShader = nil
+        for _, r in ipairs(redraws) do
+          local wanted = r.colors
+            and (r.keyed and PaletteFX.keyedShader() or PaletteFX.shader())
+            or nil
+          if wanted ~= activeShader then
+            activeShader = wanted
+            love.graphics.setShader(wanted)
+          end
+          if wanted then PaletteFX.sendColors(wanted, r.colors) end
+          if r.quad then
+            love.graphics.draw(r.image, r.quad, wox + r.x * sx, woy + r.y * sy,
+                               0, sx * r.sx, sy)
+          else
+            love.graphics.draw(r.image, wox + r.x * sx, woy + r.y * sy,
+                               0, sx * r.sx, sy)
+          end
+        end
+        if activeShader then love.graphics.setShader() end
+        love.graphics.setScissor()
+      end
+    end
+    -- Composite the tilt upright pass over the ground (projected or, in the
+    -- rare no-shader fallback, flat).  It already carries its billboards'
+    -- projected positions and per-sprite SGB colorization on a transparent
+    -- canvas, so it just needs the same centred integer-scale blit the flat
+    -- world pass uses -- no zone scissoring.  uprightActive is only ever
+    -- set in tilt mode, so flat frames skip this and stay identical.
+    if self.uprightActive then
+      local M = self.UPRIGHT_MARGIN
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.setScissor(0, 0, ww, wh)
+      love.graphics.draw(self.uprightCanvas, wox - M * sx, woy - M * sy, 0, sx, sy)
+      love.graphics.setScissor()
+    end
+    -- Screen-space warp fade (Transition) over the full world composite so
+    -- survey zoom / tilt edges darken with the center, not only the 160x144
+    -- UI letterbox.  Drawn before the UI blit so menus above a fade still
+    -- composite normally if one is ever stacked that way.
+    local fade = self.worldFadeAlpha
+    if fade and fade > 0 then
+      love.graphics.setColor(0, 0, 0, fade)
+      love.graphics.rectangle("fill", 0, 0, ww, wh)
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+    -- Battle transition: cascade black blocks into the area outside the
+    -- classic 160x144 wipe square (world still shows through until filled).
+    if self.battleCascadeProg then
+      self:drawBattleCascade(self.battleCascadeProg, ww, wh, ox, oy, vpw, vph, Sx, Sy)
+    end
+  end
+  -- In OpenXR the UI is copied to a dedicated composition-layer quad.  The
+  -- runtime projects that one physical panel into both eyes, so menus fuse
+  -- instead of appearing as two slightly divergent screen-space copies.
+  -- Its pose is captured once by the bridge and remains fixed in LOCAL
+  -- space; F8 deliberately establishes a new anchor in front of the head.
+  if OpenXR.isActive() and OpenXR.inWorldUI and OpenXR.inWorldUI() then
+    -- The current frame's UI is already a tracked, depth-tested object in
+    -- the projection image.  Do not submit the fallback floating UI or
+    -- battle quads on top of it.
+  elseif OpenXR.isActive() then
+    local previous = love.graphics.getCanvas()
+    local battleCaptured = true
+    if self.vrBattle then
+      if not self.vrBattleCanvas then
+        self.vrBattleCanvas = love.graphics.newCanvas(
+          self.WIDTH, 96, { dpiscale = 1 })
+        self.vrBattleCanvas:setFilter("nearest", "nearest")
+      end
+      love.graphics.setCanvas(self.vrBattleCanvas)
+      love.graphics.clear(0, 0, 0, 0)
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(self.canvas, 0, 0)
+      if love.graphics.flushBatch then love.graphics.flushBatch() end
+      battleCaptured = OpenXR.captureBattle(self.WIDTH, 96, true)
+      local battleState = self.vrBattleState
+      if battleCaptured and battleState
+          and battleState.drawVRSpatialLayer then
+        self.vrBattleDepthCanvases = self.vrBattleDepthCanvases or {}
+        local layers = {
+          { "enemy", "captureBattleEnemy" },
+          { "attack", "captureBattleAttack" },
+          { "player", "captureBattlePlayer" },
+          { "hud", "captureBattleHUD" },
+        }
+        for _, layer in ipairs(layers) do
+          local canvas = self.vrBattleDepthCanvases[layer[1]]
+          if not canvas then
+            canvas = love.graphics.newCanvas(self.WIDTH, 96,
+                                               { dpiscale = 1 })
+            canvas:setFilter("nearest", "nearest")
+            self.vrBattleDepthCanvases[layer[1]] = canvas
+          end
+          love.graphics.setCanvas(canvas)
+          love.graphics.clear(0, 0, 0, 0)
+          battleState:drawVRSpatialLayer(layer[1])
+          if love.graphics.flushBatch then love.graphics.flushBatch() end
+          local capture = OpenXR[layer[2]]
+          battleCaptured = capture
+            and capture(self.WIDTH, 96, true) and battleCaptured or false
+        end
+      end
+    end
+    if not self.vrUICanvas then
+      self.vrUICanvas = love.graphics.newCanvas(
+        self.WIDTH, self.HEIGHT, { dpiscale = 1 })
+      self.vrUICanvas:setFilter("nearest", "nearest")
+    end
+    love.graphics.setCanvas(self.vrUICanvas)
+    love.graphics.clear(0, 0, 0, 0)
+    if self.vrBattle then
+      love.graphics.setScissor(0, 96, self.WIDTH, self.HEIGHT - 96)
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(self.canvas, 0, 0)
+      love.graphics.setScissor()
+    else
+      blit(self.canvas, 1, 1, zones, 1, 1,
+           0, 0, 0, 0, self.WIDTH, self.HEIGHT)
+    end
+    love.graphics.push("all")
+    love.graphics.setBlendMode("alpha")
+    VRPointer.draw()
+    love.graphics.pop()
+    -- The bridge copies the currently-bound OpenGL framebuffer directly.
+    -- Flush LOVE's sprite batch first or the last thing drawn (the ray and
+    -- cursor) can remain queued until after OpenXR has already copied it.
+    if love.graphics.flushBatch then love.graphics.flushBatch() end
+    local captured = OpenXR.captureUI(self.WIDTH, self.HEIGHT, true)
+                     and battleCaptured
+    love.graphics.setCanvas(previous)
+
+    -- Keep menus usable with a stale DLL: the old side-by-side behavior is
+    -- only a fallback and disappears as soon as the rebuilt bridge exposes
+    -- the anchored quad entry point.
+    if not captured then
+      local eyeW = ww / 2
+      local uiScale = math.max(1,
+        math.floor(math.min(eyeW / self.WIDTH, wh / self.HEIGHT) * 0.62))
+      local uiW, uiH = self.WIDTH * uiScale, self.HEIGHT * uiScale
+      local uiY = math.floor((wh - uiH) / 2)
+      for eye = 0, 1 do
+        local eyeX = eye * eyeW
+        local uiX = eyeX + math.floor((eyeW - uiW) / 2)
+        blit(self.canvas, uiScale, uiScale, zones, uiScale, uiScale,
+             uiX, uiY, eyeX, 0, eyeW, wh)
+      end
+    end
+  else
+    -- UI stays in the classic centered GB letterbox
+    blit(self.canvas, Sx, Sy, zones, Sx, Sy, ox, oy, ox, oy, vpw, vph)
+  end
+
+  if present then
+    love.graphics.setCanvas()
+    -- Post-process pipelines run over the finished composite -- world, UI
+    -- and all -- and before GBC FX, so a blur or colour grade is what the
+    -- LCD grid is then drawn over rather than something that smears the
+    -- grid itself.  Each pass hands back a canvas; with none registered
+    -- this returns `present` unchanged and the frame is byte-identical.
+    local composed = Pipelines.present(present,
+      { width = ww, height = wh, scale = Sp, dpi = dpiY, dpiX = dpiX, dpiY = dpiY }) or present
+    if GBCFX.active() then
+      -- shader grid/shadow math is in framebuffer pixels
+      GBCFX.present(composed, Sp)
+    else
+      -- the present canvas only existed for the post-process, so put the
+      -- result on the screen at the same 1:1 unit mapping it was built at
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(composed, 0, 0)
+    end
+  end
+  self.worldActive = false
+  self.uprightActive = false
+  self.worldOverride = nil
+  PaletteFX.setPass(nil)
+end
+
+return Renderer
