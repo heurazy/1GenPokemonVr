@@ -10,6 +10,8 @@ assets/generated/
 
 # Local saves (LÖVE writes to its save dir, but keep the repo clean anyway)
 save/
+nul
+NUL
 
 __pycache__/
 *.pyc

@@ -138,7 +138,21 @@ try {
     "-Papp.version_code=$code",
     "assembleQuestNoRecord$Configuration"
   )
-  & .\gradlew.bat @gradleArgs
+  $wrapperJar = Join-Path (Get-Location) "gradle\wrapper\gradle-wrapper.jar"
+  if ((Test-Path -LiteralPath ".\gradlew.bat" -PathType Leaf) -and
+      (Test-Path -LiteralPath $wrapperJar -PathType Leaf)) {
+    & .\gradlew.bat @gradleArgs
+  } else {
+    # Clean source-only publication checkouts intentionally omit binary JARs,
+    # including gradle-wrapper.jar. CI installs Gradle 8.1 explicitly; use it
+    # as a safe fallback while normal development checkouts keep the wrapper.
+    $gradle = Get-Command gradle.bat -ErrorAction SilentlyContinue
+    if (-not $gradle) { $gradle = Get-Command gradle -ErrorAction SilentlyContinue }
+    if (-not $gradle) {
+      throw "Gradle 8.1 was not found and gradle-wrapper.jar is unavailable"
+    }
+    & $gradle.Source @gradleArgs
+  }
   if ($LASTEXITCODE -ne 0) { throw "Quest APK build failed" }
 } finally {
   if ($locationPushed) { Pop-Location }
