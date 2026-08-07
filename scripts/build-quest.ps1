@@ -73,8 +73,24 @@ try {
 } finally { $archive.Dispose() }
 
 Write-Host "Building the ARM64 OpenXR/GLES bridge..."
+$questBridgeSource = Join-Path $root "native\openxr_bridge\quest"
+$cmakeCache = Join-Path $build "CMakeCache.txt"
+if (Test-Path -LiteralPath $cmakeCache -PathType Leaf) {
+  $homeLine = Get-Content -LiteralPath $cmakeCache |
+    Where-Object { $_ -like 'CMAKE_HOME_DIRECTORY:INTERNAL=*' } |
+    Select-Object -First 1
+  $cachedHome = if ($homeLine) { ($homeLine -split '=', 2)[1] } else { $null }
+  if ($cachedHome) {
+    $cachedFull = [IO.Path]::GetFullPath($cachedHome).TrimEnd('\','/')
+    $sourceFull = [IO.Path]::GetFullPath($questBridgeSource).TrimEnd('\','/')
+    if ($cachedFull -ne $sourceFull) {
+      Write-Host "Discarding CMake cache from another checkout..."
+      Remove-Item -LiteralPath $build -Recurse -Force
+    }
+  }
+}
 $toolchain = Join-Path $ndk "build\cmake\android.toolchain.cmake"
-cmake -S (Join-Path $root "native\openxr_bridge\quest") -B $build `
+cmake -S $questBridgeSource -B $build `
   -G Ninja `
   "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
   "-DANDROID_ABI=arm64-v8a" `
@@ -96,16 +112,25 @@ Copy-Item -LiteralPath $cxx -Destination $jni -Force
 Write-Host "Building the standalone Quest APK..."
 $env:ANDROID_SDK_ROOT = $sdk
 $env:ANDROID_HOME = $sdk
-$java17 = Join-Path $deps "jdk-17"
-if (-not (Test-Path (Join-Path $java17 "bin\java.exe"))) {
-  $javaZip = Join-Path $deps "jdk-17.zip"
-  Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile $javaZip
-  $unpack = Join-Path $deps "jdk-17-unpack"
-  if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force }
-  Expand-Archive -LiteralPath $javaZip -DestinationPath $unpack -Force
-  $jdkDir = Get-ChildItem -LiteralPath $unpack -Directory | Select-Object -First 1
-  if (-not $jdkDir) { throw "The downloaded JDK archive did not contain a JDK directory" }
-  Move-Item -LiteralPath $jdkDir.FullName -Destination $java17
+$java17 = $null
+if ($env:JAVA_HOME -and
+    (Test-Path -LiteralPath (Join-Path $env:JAVA_HOME "bin\java.exe") -PathType Leaf)) {
+  # GitHub Actions/setup-java and normal developer machines already provide a
+  # JDK. Reuse it instead of downloading a second Java runtime during every
+  # clean Quest build.
+  $java17 = [IO.Path]::GetFullPath($env:JAVA_HOME)
+} else {
+  $java17 = Join-Path $deps "jdk-17"
+  if (-not (Test-Path (Join-Path $java17 "bin\java.exe"))) {
+    $javaZip = Join-Path $deps "jdk-17.zip"
+    Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile $javaZip
+    $unpack = Join-Path $deps "jdk-17-unpack"
+    if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force }
+    Expand-Archive -LiteralPath $javaZip -DestinationPath $unpack -Force
+    $jdkDir = Get-ChildItem -LiteralPath $unpack -Directory | Select-Object -First 1
+    if (-not $jdkDir) { throw "The downloaded JDK archive did not contain a JDK directory" }
+    Move-Item -LiteralPath $jdkDir.FullName -Destination $java17
+  }
 }
 $env:JAVA_HOME = $java17
 $code = ([int]($Version.Split('.')[0]) * 10000) + ([int]($Version.Split('.')[1]) * 100) + [int]($Version.Split('.')[2])
