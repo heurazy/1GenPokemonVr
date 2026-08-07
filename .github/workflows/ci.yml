@@ -41,7 +41,7 @@ jobs:
         run: luajit -v
 
       - name: run every ROM-free tier
-        run: ./scripts/test.sh
+        run: bash scripts/test.sh
 
   fixture-dataset:
     name: fixture dataset integrity
